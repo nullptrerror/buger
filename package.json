@@ -1,0 +1,20 @@
+{
+  "name": "burger-site",
+  "private": true,
+  "scripts": {
+    "prebuild": "node -e \"try { const fs=require('fs'); ['node_modules/@esbuild/linux-x64/bin/esbuild','node_modules/esbuild/bin/esbuild'].forEach(p => { if (fs.existsSync(p)) fs.chmodSync(p, 0o755); }); } catch(e){}\"",
+    "build": "node ./scripts/build.mjs",
+    "split": "node ./scripts/split-video.mjs",
+    "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/deploy.ps1",
+    "deploy:pages": "wrangler pages deploy dist"
+  },
+  "allowScripts": {
+    "esbuild": true
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.10",
+    "javascript-obfuscator": "^5.8.0",
+    "sharp": "^0.35.5",
+    "wrangler": "^4.145.0"
+  }
+}

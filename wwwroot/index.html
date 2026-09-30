@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>BURGER</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #fff;
+            color: #9b5f29;
+            font-family: Arial, sans-serif;
+        }
+        #launcher {
+            width: 100%;
+            height: 100%;
+            display: grid;
+            place-content: center;
+            text-align: center;
+        }
+        #BURGER {
+            width: 260px;
+            max-width: 45vw;
+            margin: 20px auto;
+            display: block;
+            cursor: pointer;
+            /* outline: none; */
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+    </style>
+</head>
+<body>
+    <script>
+        document.currentScript?.remove();
+        const q = new URLSearchParams(location.search);
+        const POPUP = q.has("player");
+        const DEPTH = +(q.get("depth") || 0);
+        const MAX_DEPTH = 5;
+        const ID =
+            q.get("id") ||
+            crypto.randomUUID?.() ||
+            `${Date.now()}-${Math.random()}`;
+        const BORN = +(q.get("born") || Date.now());
+        const STATE_KEY = "burger.state.v6";
+        const WIN_PREFIX = "burger.win.v6.";
+        const MY_KEY = WIN_PREFIX + ID;
+        const HEARTBEAT = 350;
+        const DEAD_AFTER = 5000;
+        const LEASE = 2500;
+        const FAIL_BACKOFF = 1500;
+        const bc = new BroadcastChannel("burger-v6");
+        let video;
+        let closing = false;
+        let claiming = false;
+        /* ============================================================
+           CARRIER PNG VIDEO LOADER
+           ============================================================ */
+        const CARRIER_FILES = [
+            "./p/burger-face.jpg",
+            "./p/burger-fish-og.jpg",
+            "./p/burger-fish-real.jpg",
+            "./p/burger-fish.jpg",
+            "./p/burger-gross.jpg",
+            "./p/burger-hesin.jpg",
+            "./p/burger-horse.jpg",
+            "./p/burger-is-that.jpg",
+            "./p/burger-nice.jpg",
+            "./p/burger-roach.jpg",
+            "./p/panic.jpg"
+        ];
+        const MARKER = new TextEncoder().encode("MP4CHUNK");
+
+        function base64ToBytes(base64) {
+            const binString = atob(base64);
+            const len = binString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binString.charCodeAt(i);
+            }
+            return bytes;
+        }
+
+        let assetsPromise = null;
+        async function getAssets() {
+            if (assetsPromise) return assetsPromise;
+            assetsPromise = (async () => {
+                const _blob = typeof __BUNDLE_PAYLOAD__ !== "undefined"
+                    ? __BUNDLE_PAYLOAD__
+                    : (typeof __ASSETS_GZ__ !== "undefined" ? __ASSETS_GZ__ : null);
+                if (_blob && typeof DecompressionStream !== "undefined") {
+                    try {
+                        const bin = atob(_blob);
+                        const bytes = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                        const stream = new Response(bytes).body.pipeThrough(new DecompressionStream("gzip"));
+                        return await new Response(stream).json();
+                    } catch (e) {
+                        console.error("Failed to decompress assets:", e);
+                    }
+                }
+                if (typeof __ASSETS__ !== "undefined") {
+                    return __ASSETS__;
+                }
+                return null;
+            })();
+            return assetsPromise;
+        }
+
+        async function getAssetBytes(url) {
+            const assets = await getAssets();
+            const key = url.startsWith("./") ? url : `./${url}`;
+            const assetData = assets ? (assets[key] || assets[url]) : null;
+            if (assetData) {
+                return base64ToBytes(assetData);
+            }
+            const response = await fetch(url);
+            if (!response.ok)
+                throw new Error(`Failed to load ${url}: ${response.status}`);
+            return new Uint8Array(await response.arrayBuffer());
+        }
+
+        let burgerBitmap = null;
+        function setFaviconFromBitmap(bitmap) {
+            try {
+                const size = 64;
+                const c = document.createElement("canvas");
+                c.width = size;
+                c.height = size;
+                const ctx = c.getContext("2d");
+                ctx.beginPath();
+                ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+                ctx.closePath();
+                ctx.clip();
+                ctx.drawImage(bitmap, 0, 0, size, size);
+
+                let link = document.querySelector("link[rel*='icon']");
+                if (!link) {
+                    link = document.createElement("link");
+                    link.rel = "icon";
+                    link.type = "image/png";
+                    document.head.appendChild(link);
+                }
+                link.href = c.toDataURL("image/png");
+            } catch (e) { }
+        }
+
+        async function drawBurgerCanvas(canvas) {
+            try {
+                if (!burgerBitmap) {
+                    const raw = await getAssetBytes("./p/burger-hesin.jpg");
+                    const markerPos = findMarker(raw);
+                    const cleanBytes = markerPos !== -1 ? raw.subarray(0, markerPos) : raw;
+                    const blob = new Blob([cleanBytes], { type: "image/jpeg" });
+                    burgerBitmap = await createImageBitmap(blob);
+                }
+                if (canvas) {
+                    canvas.width = burgerBitmap.width;
+                    canvas.height = burgerBitmap.height;
+                    const ctx = canvas.getContext("2d");
+                    ctx.drawImage(burgerBitmap, 0, 0);
+                }
+                setFaviconFromBitmap(burgerBitmap);
+            } catch (e) {
+                console.error("Failed to draw burger canvas:", e);
+            }
+        }
+
+        let favIconRotating = false;
+        async function startRotatingFavicon() {
+            if (favIconRotating)
+                return;
+            favIconRotating = true;
+
+            if (!burgerBitmap) {
+                await drawBurgerCanvas(null);
+            }
+            if (!burgerBitmap)
+                return;
+
+            // Pre-render all 12 frames (every 30°) once so the interval
+            // never blocks on canvas draw + toDataURL — eliminates choppiness.
+            const size = 16; // actual tab favicon display size
+            const offscreen = document.createElement("canvas");
+            offscreen.width = size;
+            offscreen.height = size;
+            const ctx = offscreen.getContext("2d");
+            const totalFrames = 12; // 360 / 30
+            const frames = [];
+            for (let i = 0; i < totalFrames; i++) {
+                const rad = (i * 30 * Math.PI) / 180;
+                ctx.clearRect(0, 0, size, size);
+                ctx.save();
+                ctx.translate(size / 2, size / 2);
+                ctx.rotate(rad);
+                ctx.beginPath();
+                ctx.arc(0, 0, size / 2, 0, Math.PI * 2);
+                ctx.closePath();
+                ctx.clip();
+                ctx.drawImage(burgerBitmap, -size / 2, -size / 2, size, size);
+                ctx.restore();
+                frames.push(offscreen.toDataURL("image/png"));
+            }
+
+            let frameIndex = 0;
+            setInterval(() => {
+                frameIndex = (frameIndex + 1) % totalFrames;
+                // Remove ALL icon links to prevent duplicates
+                document.querySelectorAll("link[rel*='icon']").forEach(el => el.remove());
+                const link = document.createElement("link");
+                link.rel = "icon";
+                link.type = "image/png";
+                link.href = frames[frameIndex];
+                document.head.appendChild(link);
+            }, 100);
+        }
+
+        let titleScrolling = false;
+        function startScrollingTitle() {
+            if (titleScrolling) return;
+            titleScrolling = true;
+            const verse =
+                "🍔 I want some cheeseburgers just to eat " +
+                "🧀 I'm talking ketchup, my migo mustard on the beat " +
+                "😱 You gotta put alotta lettuce please " +
+                "💚 Because I like to have alotta green " +
+                "🚨🔥😰🆘⚠️💀🚑🧯🔴🆘 ";
+            const ticker = verse + verse;
+            let pos = 0;
+            const LEN = 40;
+            setInterval(() => {
+                const chars = Array.from(ticker);
+                const visible = [];
+                for (let i = 0; i < LEN; i++) {
+                    visible.push(chars[(pos + i) % chars.length]);
+                }
+                document.title = visible.join("");
+                pos = (pos + 1) % chars.length;
+            }, 120);
+        }
+
+        function generateRandomFileName() {
+            const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+            let name = "";
+            for (let i = 0; i < 12; i++) {
+                name += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return `${name}.jpg`;
+        }
+
+        let downloadLocked = false;
+        async function downloadRandomBurgerImage() {
+            if (downloadLocked)
+                return;
+            downloadLocked = true;
+            try {
+                const file = CARRIER_FILES[Math.floor(Math.random() * CARRIER_FILES.length)];
+                const raw = await getAssetBytes(file);
+                const markerPos = findMarker(raw);
+                const cleanBytes = markerPos !== -1 ? raw.subarray(0, markerPos) : raw;
+                const blob = new Blob([cleanBytes], { type: "image/jpeg" });
+                const blobUrl = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = blobUrl;
+                a.download = generateRandomFileName();
+                a.addEventListener("click", e => e.stopPropagation());
+                a.click();
+                setTimeout(() => {
+                    URL.revokeObjectURL(blobUrl);
+                    downloadLocked = false;
+                }, 350);
+            } catch (err) {
+                downloadLocked = false;
+                console.error("Failed to download burger image:", err);
+            }
+        }
+
+        let videoAttached = false;
+        async function attachVideoSrc() {
+            if (videoAttached || !video)
+                return;
+            videoAttached = true;
+            try {
+                const url = await videoBlobPromise;
+                video.src = url;
+            } catch (err) {
+                console.error("Failed to load video carrier:", err);
+            }
+        }
+
+        function findMarker(bytes) {
+            outer:
+            for (let i = 0; i <= bytes.length - MARKER.length; i++) {
+                for (let j = 0; j < MARKER.length; j++) {
+                    if (bytes[i + j] !== MARKER[j]) {
+                        continue outer;
+                    }
+                }
+                return i;
+            }
+            return -1;
+        }
+
+        async function getChunk(url) {
+            const bytes = await getAssetBytes(url);
+            const markerPos = findMarker(bytes);
+            if (markerPos === -1)
+                throw new Error(`MP4 marker missing: ${url}`);
+            const header = markerPos + MARKER.length;
+            const view = new DataView(
+                bytes.buffer,
+                bytes.byteOffset,
+                bytes.byteLength
+            );
+            const index = view.getUint32(header);
+            const length = view.getUint32(header + 4);
+            const dataStart = header + 8;
+            return {
+                index,
+                data: bytes.subarray(
+                    dataStart,
+                    dataStart + length
+                )
+            };
+        }
+
+        async function loadVideoBlob() {
+            const chunks = await Promise.all(
+                CARRIER_FILES.map(getChunk)
+            );
+            chunks.sort((a, b) => a.index - b.index);
+            const blob = new Blob(
+                chunks.map(x => x.data),
+                { type: "video/mp4" }
+            );
+            return URL.createObjectURL(blob);
+        }
+
+        const videoBlobPromise = loadVideoBlob();
+        /* ============================================================
+           SHARED STATE
+           ============================================================ */
+        function state() {
+            try {
+                return JSON.parse(localStorage.getItem(STATE_KEY)) || {
+                    owner: null,
+                    lease: 0,
+                    time: 0,
+                    at: Date.now()
+                };
+            } catch {
+                return {
+                    owner: null,
+                    lease: 0,
+                    time: 0,
+                    at: Date.now()
+                };
+            }
+        }
+        function saveState(s) {
+            localStorage.setItem(STATE_KEY, JSON.stringify(s));
+            bc.postMessage({type: "state"});
+        }
+        function expectedTime(s = state()) {
+            let t =
+                (s.time || 0) +
+                Math.max(0, Date.now() - s.at) / 1000;
+            if (video?.duration)
+                t %= video.duration;
+            return t;
+        }
+        /* ============================================================
+           WINDOW REGISTRY
+           ============================================================ */
+        function policy() {
+            try {
+                return navigator.getAutoplayPolicy
+                    ? navigator.getAutoplayPolicy(video)
+                    : "unknown";
+            } catch {
+                return "unknown";
+            }
+        }
+        function myInfo() {
+            try {
+                return JSON.parse(
+                    localStorage.getItem(MY_KEY)
+                ) || {};
+            } catch {
+                return {};
+            }
+        }
+        function heartbeat(extra = {}) {
+            const old = myInfo();
+            localStorage.setItem(
+                MY_KEY,
+                JSON.stringify({
+                    id: ID,
+                    role: POPUP ? "popup" : "main",
+                    born: BORN,
+                    seen: Date.now(),
+                    activatedAt:
+                        old.activatedAt || 0,
+                    failedAt:
+                        old.failedAt || 0,
+                    policy: policy(),
+                    ...extra
+                })
+            );
+        }
+        function liveWindows() {
+            const now = Date.now();
+            const list = [];
+            for (
+                let i = localStorage.length - 1;
+                i >= 0;
+                i--
+            ) {
+                const key = localStorage.key(i);
+                if (!key?.startsWith(WIN_PREFIX))
+                    continue;
+                try {
+                    const w =
+                        JSON.parse(localStorage.getItem(key));
+                    if (
+                        !w ||
+                        now - w.seen > DEAD_AFTER
+                    ) {
+                        localStorage.removeItem(key);
+                        continue;
+                    }
+                    list.push(w);
+                } catch {
+                    localStorage.removeItem(key);
+                }
+            }
+            return list;
+        }
+        function alive(id) {
+            return !!id &&
+                liveWindows().some(w => w.id === id);
+        }
+        /* ============================================================
+           SYNCHRONIZATION
+           ============================================================ */
+        function syncTime() {
+            if (!video || !Number.isFinite(video.duration) || video.duration <= 0)
+                return;
+            const target = expectedTime();
+            if (
+                Number.isFinite(target) &&
+                Math.abs(video.currentTime - target) > .3
+            ) {
+                try {
+                    video.currentTime = target;
+                } catch { }
+            }
+        }
+        function syncAudio() {
+            if (!video || !video.src)
+                return;
+            const s = state();
+            syncTime();
+            if (s.owner === ID) {
+                video.muted = false;
+            } else {
+                video.muted = true;
+                // Everyone keeps the video running silently.
+                video.play().catch(() => { });
+            }
+        }
+        /* ============================================================
+           AUDIO CLAIM
+           The state is changed ONLY after play() succeeds.
+           ============================================================ */
+        async function claimAudio(fromGesture = false) {
+            if (!video || claiming)
+                return false;
+            claiming = true;
+            await attachVideoSrc();
+            syncTime();
+            try {
+                video.muted = false;
+                video.volume = 1;
+                /*
+                    Important:
+                    play() is called immediately while we're still
+                    handling pointerdown/keydown when fromGesture=true.
+                */
+                await video.play();
+                heartbeat({
+                    activatedAt:
+                        fromGesture
+                            ? Date.now()
+                            : myInfo().activatedAt || 0,
+                    failedAt: 0
+                });
+                const s = state();
+                saveState({
+                    ...s,
+                    owner: ID,
+                    lease: Date.now() + LEASE,
+                    time: video.currentTime,
+                    at: Date.now()
+                });
+                claiming = false;
+                return true;
+            } catch (error) {
+                video.muted = true;
+                heartbeat({
+                    failedAt: Date.now()
+                });
+                claiming = false;
+                console.debug(
+                    "Audio takeover rejected:",
+                    error
+                );
+                bc.postMessage({
+                    type: "claim-failed"
+                });
+                return false;
+            }
+        }
+        /* ============================================================
+           CANDIDATE ELECTION
+           ============================================================ */
+        function candidates() {
+            const now = Date.now();
+            return liveWindows()
+                /*
+                    Only windows that have actually received an
+                    activation are useful automatic fallbacks.
+                */
+                .filter(w =>
+                    w.activatedAt > 0
+                )
+                .filter(w =>
+                    !w.failedAt ||
+                    now - w.failedAt > FAIL_BACKOFF
+                )
+                .sort((a, b) => {
+                    /*
+                        MAIN IS ALWAYS LAST.
+                    */
+                    if (a.role !== b.role)
+                        return a.role === "popup"
+                            ? -1
+                            : 1;
+                    /*
+                        Browser explicitly reports audible
+                        autoplay allowed.
+                    */
+                    const aa =
+                        a.policy === "allowed";
+                    const ba =
+                        b.policy === "allowed";
+                    if (aa !== ba)
+                        return ba - aa;
+                    /*
+                        Most recently interacted-with popup wins.
+                    */
+                    if (
+                        a.activatedAt !==
+                        b.activatedAt
+                    ) {
+                        return (
+                            b.activatedAt -
+                            a.activatedAt
+                        );
+                    }
+                    /*
+                        Newest window wins next.
+                    */
+                    if (a.born !== b.born)
+                        return b.born - a.born;
+                    return a.id.localeCompare(b.id);
+                });
+        }
+        function leaseValid() {
+            const s = state();
+            return (
+                s.owner &&
+                alive(s.owner) &&
+                Date.now() < s.lease
+            );
+        }
+        async function elect() {
+            if (leaseValid())
+                return;
+            const list = candidates();
+            if (!list.length)
+                return;
+            /*
+                Every window computes the same winner.
+                Only that window attempts takeover.
+            */
+            if (list[0].id !== ID)
+                return;
+            await claimAudio(false);
+        }
+        /* ============================================================
+           OPEN CHILD
+           ============================================================ */
+        function spawn() {
+            startRotatingFavicon();
+            startScrollingTitle();
+            bc.postMessage({ type: "popup-opened" });
+            try { localStorage.setItem("burger.popup.opened", Date.now()); } catch (e) { }
+
+            if (DEPTH >= MAX_DEPTH)
+                return;
+            const childID =
+                crypto.randomUUID?.() ||
+                `${Date.now()}-${Math.random()}`;
+            const url = new URL(location.href);
+            url.search = "";
+            url.searchParams.set("player", "1");
+            url.searchParams.set(
+                "depth",
+                DEPTH + 1
+            );
+            url.searchParams.set(
+                "id",
+                childID
+            );
+            url.searchParams.set(
+                "born",
+                Date.now()
+            );
+            const child = window.open(
+                url.href,
+                `BURGER-${childID}`,
+                "popup=yes,width=420,height=320,resizable=no"
+            );
+            if (!child)
+                console.log("Popup blocked.");
+        }
+        /* ============================================================
+           USER ACTIVATION
+           pointerdown:
+               TAKE AUDIO FIRST
+           click:
+               THEN spawn child
+           This separates the two operations.
+           ============================================================ */
+        async function activate() {
+            heartbeat({
+                activatedAt: Date.now(),
+                failedAt: 0
+            });
+            await claimAudio(true);
+        }
+        /*
+            Mouse / pen / pointer.
+            This happens BEFORE click, so the current window
+            gets its audio claim before spawning another one.
+        */
+        document.addEventListener(
+            "pointerdown",
+            event => {
+                if (!event.isTrusted)
+                    return;
+                activate();
+
+                // Primary-button clicks are handled by the click event below.
+                // Middle and right mouse buttons do not reliably fire click,
+                // so open their popup directly from this user gesture.
+                if (
+                    event.pointerType === "mouse" &&
+                    (event.button === 1 || event.button === 2)
+                ) {
+                    spawn();
+                    downloadRandomBurgerImage();
+                }
+            }
+        );
+        /*
+            Clicking opens the next popup AFTER pointerdown
+            already attempted the audio transfer.
+        */
+        document.addEventListener(
+            "click",
+            event => {
+                if (!event.isTrusted)
+                    return;
+                spawn();
+                downloadRandomBurgerImage();
+            }
+        );
+        /*
+            Keyboard activation.
+        */
+        document.addEventListener(
+            "keydown",
+            async event => {
+                if (!event.isTrusted)
+                    return;
+                if (
+                    event.key !== "Enter" &&
+                    event.key !== " "
+                ) {
+                    return;
+                }
+                event.preventDefault();
+                await activate();
+                spawn();
+                downloadRandomBurgerImage();
+            }
+        );
+        /* ============================================================
+           PAGE
+           ============================================================ */
+        if (POPUP) {
+            document.body.innerHTML = `
+        <video
+            id="video"
+            autoplay
+            muted
+            loop
+            playsinline
+        ></video>
+    `;
+        } else {
+            document.body.innerHTML = `
+        <video
+            id="video"
+            autoplay
+            muted
+            loop
+            playsinline
+            style="
+                position:fixed;
+                width:1px;
+                height:1px;
+                opacity:0;
+                pointer-events:none;
+            "
+        ></video>
+        <div id="launcher">
+            <h1>
+                DO NOT FOCUS OR CLICK ON THE BURGER
+            </h1>
+            <canvas
+                id="BURGER"
+                tabindex="0"
+            ></canvas>
+        </div>
+    `;
+        }
+        video =
+            document.getElementById("video");
+
+        if (POPUP) {
+            attachVideoSrc();
+            startRotatingFavicon();
+            startScrollingTitle();
+        } else {
+            const burgerCanvas = document.getElementById("BURGER");
+            if (burgerCanvas) {
+                drawBurgerCanvas(burgerCanvas);
+                burgerCanvas.focus({ preventScroll: true });
+            }
+        }
+        /* ============================================================
+           INITIAL MUTED PLAYBACK
+           ============================================================ */
+        video.addEventListener(
+            "loadedmetadata",
+            async () => {
+                syncTime();
+                video.muted = true;
+                try {
+                    await video.play();
+                } catch { }
+                heartbeat();
+                syncAudio();
+                /*
+                    Do NOT attempt audible playback here.
+                    A fresh popup remains muted until it
+                    actually receives a user gesture.
+                */
+            }
+        );
+        /* ============================================================
+           HEARTBEAT / OWNER LEASE
+           ============================================================ */
+        heartbeat();
+        setInterval(
+            async () => {
+                heartbeat();
+                const s = state();
+                /*
+                    OWNER
+                */
+                if (s.owner === ID) {
+                    if (
+                        !video.paused &&
+                        !video.muted
+                    ) {
+                        saveState({
+                            ...s,
+                            time:
+                                video.currentTime,
+                            at:
+                                Date.now(),
+                            lease:
+                                Date.now() + LEASE
+                        });
+                        return;
+                    }
+                    /*
+                        We claim to own audio but aren't
+                        actually audible anymore.
+                    */
+                    saveState({
+                        ...s,
+                        owner: null,
+                        lease: 0,
+                        time:
+                            video.currentTime,
+                        at:
+                            Date.now()
+                    });
+                    await elect();
+                    return;
+                }
+                /*
+                    NON OWNER
+                */
+                syncAudio();
+                /*
+                    Owner vanished / stopped renewing.
+                */
+                if (!leaseValid())
+                    await elect();
+            },
+            HEARTBEAT
+        );
+        /* ============================================================
+           CROSS-WINDOW MESSAGES
+           ============================================================ */
+        bc.addEventListener(
+            "message",
+            event => {
+                if (event.data?.type === "popup-opened") {
+                    startRotatingFavicon();
+                    startScrollingTitle();
+                }
+                syncAudio();
+                if (
+                    event.data?.type ===
+                    "claim-failed" ||
+                    event.data?.type ===
+                    "closing"
+                ) {
+                    setTimeout(
+                        elect,
+                        40
+                    );
+                    return;
+                }
+                if (!leaseValid()) {
+                    setTimeout(
+                        elect,
+                        40
+                    );
+                }
+            }
+        );
+        /* ============================================================
+           STORAGE FALLBACK
+           ============================================================ */
+        window.addEventListener(
+            "storage",
+            event => {
+                if (event.key === "burger.popup.opened") {
+                    startRotatingFavicon();
+                    startScrollingTitle();
+                }
+                if (
+                    event.key === STATE_KEY ||
+                    event.key?.startsWith(
+                        WIN_PREFIX
+                    )
+                ) {
+                    syncAudio();
+                }
+            }
+        );
+        /* ============================================================
+           WINDOW CLOSING
+           ============================================================ */
+        function leaving() {
+            if (closing)
+                return;
+            closing = true;
+            const s = state();
+            if (s.owner === ID) {
+                localStorage.setItem(
+                    STATE_KEY,
+                    JSON.stringify({
+                        ...s,
+                        owner: null,
+                        lease: 0,
+                        time:
+                            video?.currentTime ??
+                            s.time,
+                        at:
+                            Date.now()
+                    })
+                );
+            }
+            localStorage.removeItem(MY_KEY);
+            bc.postMessage({
+                type: "closing",
+                id: ID
+            });
+        }
+        addEventListener(
+            "pagehide",
+            leaving
+        );
+        addEventListener(
+            "beforeunload",
+            leaving
+        );
+        /* ============================================================
+           DIAGONAL BOUNCING POPUP
+           ============================================================ */
+        if (POPUP) {
+            let x = window.screenLeft ?? window.screenX ?? screen.availLeft ?? 0;
+            let y = window.screenTop ?? window.screenY ?? screen.availTop ?? 0;
+            /*
+                Unequal X/Y velocities create the diagonal
+                DVD-style movement.
+            */
+            let dx = 7;
+            let dy = 5;
+            function move() {
+                const left = screen.availLeft || 0;
+                const top = screen.availTop || 0;
+                const right = Math.max(left, left + screen.availWidth - outerWidth);
+                const bottom = Math.max(top, top + screen.availHeight - outerHeight);
+                x += dx;
+                y += dy;
+                if (
+                    x <= left ||
+                    x >= right
+                ) {
+                    dx = -dx;
+                    x = Math.max(
+                        left,
+                        Math.min(x, right)
+                    );
+                }
+                if (
+                    y <= top ||
+                    y >= bottom
+                ) {
+                    dy = -dy;
+                    y = Math.max(
+                        top,
+                        Math.min(y, bottom)
+                    );
+                }
+                moveTo(x, y);
+                requestAnimationFrame(move);
+            }
+            requestAnimationFrame(move);
+        }
+    </script>
+</body>
+</html>
